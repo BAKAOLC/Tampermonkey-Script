@@ -1,9 +1,9 @@
 // ==UserScript==
 // @license     MIT
 // @name        Bilibili 粉丝勋章自动保活
-// @description 不限开播或点亮状态，成功发送满 24 小时后随机点赞；最先启动的 B 站标签页控制任务，失去响应后接管。
+// @description 每隔 20–45 分钟按洗牌队列选择一个 24 小时内未点赞的勋章，未点赞过的优先，未激活的临时优先；页面内管理和控制。
 // @author      BAKAOLC
-// @version     1.2.0
+// @version     1.3.5
 // @match       https://*.bilibili.com/*
 // @match       https://bilibili.com/*
 // @namespace   none
@@ -14,7 +14,6 @@
 // @grant       GM.getTabs
 // @grant       GM_registerMenuCommand
 // @grant       GM_addValueChangeListener
-// @grant       GM_notification
 // @grant       GM_xmlhttpRequest
 // @connect     api.live.bilibili.com
 // @run-at      document-start
@@ -27,13 +26,14 @@
   'use strict'
 
   const SCRIPT_NAME = '粉丝勋章自动保活'
+  const SCRIPT_VERSION = '1.3.5'
   const API_BASE = 'https://api.live.bilibili.com'
   const CONFIG = Object.freeze({
     defaultClickTimes: 30,
     minClickTimes: 1,
     maxClickTimes: 3000,
-    pageSize: 50,
-    maxPages: 20,
+    pageSize: 10,
+    maxPages: 100,
     initialDelayMinMs: 15_000,
     initialDelayMaxMs: 180_000,
     scanIntervalMinMs: 20 * 60_000,
@@ -57,6 +57,9 @@
     room: (uid, roomId) => `bmk:room:v2:${uid}:${roomId}`,
     schedule: uid => `bmk:schedule:v2:${uid}`,
     request: uid => `bmk:request:v2:${uid}`,
+    queue: uid => `bmk:queue:v1:${uid}`,
+    medals: uid => `bmk:medals:v1:${uid}`,
+    paused: uid => `bmk:paused:v1:${uid}`,
   })
   const log = (...args) => console.log(`[${SCRIPT_NAME}]`, ...args)
   const warn = (...args) => console.warn(`[${SCRIPT_NAME}]`, ...args)
@@ -140,7 +143,7 @@
     .filter(value => value.seenAt + CONFIG.leaseDurationMs > now && value.state !== 'closed')
     .sort(comparePeers)[0]
   const publishPeer = async patch => {
-    peer = { ...peer, ...patch, ownerId, startedAt, page: location.origin + location.pathname }
+    peer = { ...peer, ...patch, ownerId, startedAt, version: SCRIPT_VERSION, page: location.origin + location.pathname }
     await bounded(GM.saveTab({ ...tabInfo, [STORAGE.peer]: peer }))
   }
   const loseSession = () => {
@@ -163,7 +166,7 @@
     await assertSession(current)
     const stored = await getValue(STORAGE.status, {})
     const previous = patch.uid !== undefined && stored.uid !== patch.uid ? {} : stored
-    await setValue(STORAGE.status, { ...previous, ...patch, ownerId, term: current.term,
+    await setValue(STORAGE.status, { ...previous, ...patch, ownerId, term: current.term, version: SCRIPT_VERSION,
       updatedAt: Date.now(), page: location.origin + location.pathname })
   }
 
@@ -229,16 +232,19 @@
   const getAllMedals = async (current, uid) => {
     const medals = new Map()
     for (let page = 1; page <= CONFIG.maxPages; page += 1) {
-      const data = await apiRequest(current, uid, `/xlive/app-ucenter/v1/fansMedal/panel?page=${page}&page_size=${CONFIG.pageSize}`)
-      await assertSession(current, uid)
+      const path = `/xlive/app-ucenter/v1/fansMedal/panel?page=${page}&page_size=${CONFIG.pageSize}`
+      if (getUid() !== uid) throw new AccountChangedError()
+      const data = current ? await apiRequest(current, uid, path) : await requestOnce(path, {}, new AbortController().signal)
+      if (current) await assertSession(current, uid)
+      else if (getUid() !== uid) throw new AccountChangedError()
       if (!Array.isArray(data.list)) throw new Error('勋章列表格式异常，本轮停止')
       const items = [...data.list, ...(Array.isArray(data.special_list) ? data.special_list : [])]
       const previousSize = medals.size
       for (const item of items) {
-        const medal = item?.medal ?? {}
+        const medal = item?.medal ?? item?.medal_info ?? {}
         const room = item?.room_info ?? {}
         const anchor = item?.anchor_info ?? {}
-        const roomId = [room.room_id, room.roomid, anchor.room_id, medal.room_id].find(validId)
+        const roomId = [room.room_id, room.roomid, anchor.room_id, medal.room_id, medal.roomid, item?.room_id, item?.roomid].find(validId)
         if (!roomId) continue
         const targetId = [medal.target_id, anchor.uid, anchor.mid].find(validId)
         medals.set(String(roomId), {
@@ -246,7 +252,14 @@
           medalId: String(medal.medal_id ?? medal.id ?? ''),
           medalName: String(medal.medal_name ?? medal.name ?? ''),
           anchorName: String(anchor.nick_name ?? anchor.uname ?? ''),
+          isLighted: medal.is_lighted == null ? null : Number(medal.is_lighted) === 1,
         })
+      }
+      const totalPages = Number(data.page_info?.total_page ?? 0)
+      if (items.length > 0 && medals.size === 0) throw new Error('勋章列表有数据，但未找到有效的直播间 ID')
+      if (totalPages > 0) {
+        if (page >= totalPages) return [...medals.values()]
+        continue
       }
       const total = Number(data.total_number ?? data.total ?? 0)
       if (data.list.length === 0 || (total > 0 && medals.size >= total) ||
@@ -255,9 +268,9 @@
     }
     throw new Error('勋章列表超过分页上限，本轮停止')
   }
-  const isDueForLike = (record, now = Date.now()) => {
+  const isDueForLike = (record, now = Date.now(), inactive = false) => {
     if (!record) return true
-    if (Number(record.lastSuccessAt) > 0 && Number(record.lastSuccessAt) + CONFIG.resendIntervalMs > now) return false
+    if (!inactive && Number(record.lastSuccessAt) > 0 && Number(record.lastSuccessAt) + CONFIG.resendIntervalMs > now) return false
     return !['pending', 'unknown'].includes(record.outcome) ||
       Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs <= now
   }
@@ -273,13 +286,14 @@
     throw new Error(`直播间 ${medal.roomId} 缺少可确认的主播 UID`)
   }
   const sendLike = async (current, uid, medal, clickTimes) => {
+    if (await getValue(STORAGE.paused(uid), false)) return 'skipped'
     const anchorId = await resolveAnchorId(current, uid, medal)
     await assertSession(current, uid)
     const csrf = getCookie('bili_jct')
     if (!csrf) throw new Error('未检测到登录凭据，请先登录 Bilibili')
     const key = STORAGE.room(uid, medal.roomId)
     const previous = await getValue(key, null)
-    if (!isDueForLike(previous)) return 'skipped'
+    if (!isDueForLike(previous, Date.now(), medal.isLighted === false)) return 'skipped'
     const record = {
       lastSuccessAt: previous?.lastSuccessAt ?? 0,
       attemptedAt: Date.now(), attemptId: createId(), term: current.term,
@@ -291,6 +305,10 @@
     const saved = await getValue(key, null)
     if (saved?.attemptId !== record.attemptId) throw new LeadershipLostError()
     await assertSession(current, uid)
+    if (await getValue(STORAGE.paused(uid), false)) {
+      await setValue(key, { ...record, outcome: 'cancelled' })
+      return 'skipped'
+    }
     const body = new URLSearchParams({ click_time: String(clickTimes), room_id: medal.roomId,
       anchor_id: anchorId, uid, csrf_token: csrf, csrf, visit_id: '' }).toString()
     try {
@@ -313,34 +331,76 @@
     log(`点赞 API 已接受 ${medal.medalName || medal.roomId}`)
     return 'accepted'
   }
-  const runScan = async (current, uid) => {
+  const runScan = async (current, uid, { immediate = false } = {}) => {
     await assertSession(current, uid)
     const scanStartedAt = Date.now()
-    await updateStatus(current, { uid, phase: 'scanning', current: '', nextScanAt: 0, lastError: '' })
+    await updateStatus(current, { uid, phase: 'scanning', current: '', nextScanAt: 0, lastError: '', lastResult: '' })
     const medals = await getAllMedals(current, uid)
+    await setValue(STORAGE.medals(uid), { at: Date.now(), medals })
     const candidates = []
+    const neverLiked = new Set()
+    let cooling = 0
+    let uncertain = 0
+    let earliestEligibleAt = Infinity
     for (const medal of medals) {
-      if (isDueForLike(await getValue(STORAGE.room(uid, medal.roomId), null))) candidates.push(medal)
+      const record = await getValue(STORAGE.room(uid, medal.roomId), null)
+      if (!isDueForLike(record, Date.now(), medal.isLighted === false)) {
+        const successDueAt = Number(record?.lastSuccessAt || 0) + CONFIG.resendIntervalMs
+        const uncertainDueAt = ['pending', 'unknown'].includes(record?.outcome) ? Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs : 0
+        earliestEligibleAt = Math.min(earliestEligibleAt, Math.max(successDueAt, uncertainDueAt))
+        if (uncertainDueAt > Date.now()) uncertain += 1
+        else cooling += 1
+        continue
+      }
+      candidates.push(medal)
+      if (!(Number(record?.lastSuccessAt) > 0)) neverLiked.add(medal.roomId)
     }
-    const summary = { totalMedals: medals.length, candidates: candidates.length, accepted: 0, rejected: 0, unknown: 0, failed: 0, skipped: 0 }
+    const summary = { totalMedals: medals.length, candidates: candidates.length, cooling, uncertain, accepted: 0, rejected: 0, unknown: 0, failed: 0, skipped: 0 }
+    let lastResult = candidates.length ? '' : medals.length
+      ? `暂无候选：${cooling} 个近期已点赞，${uncertain} 个发送结果待确认；最早可处理时间：${new Date(earliestEligibleAt).toLocaleString()}`
+      : '账号没有可处理的勋章'
+    let lastError = ''
+    await updateStatus(current, { uid, lastSummary: summary, lastResult })
     const clickTimes = await getClickTimes()
-    for (const [index, medal] of shuffle(candidates).entries()) {
-      await sleep(randomInt(CONFIG.roomDelayMinMs, CONFIG.roomDelayMaxMs), current.controller.signal)
+    // 保留洗牌队列的顺序，新候选也先洗牌；未成功点赞过的排在已点过的前面。
+    const eligibleIds = new Set(candidates.map(medal => medal.roomId))
+    const storedQueue = await getValue(STORAGE.queue(uid), [])
+    const queue = [...new Set(Array.isArray(storedQueue) ? storedQueue : [])].filter(id => eligibleIds.has(id))
+    const queuedIds = new Set(queue)
+    queue.push(...shuffle(candidates.filter(medal => !queuedIds.has(medal.roomId))).map(medal => medal.roomId))
+    const ordered = [...queue.filter(id => neverLiked.has(id)), ...queue.filter(id => !neverLiked.has(id))]
+    // 每轮重新读取激活状态；未激活的越过成功点赞冷却和随机队列，临时优先。
+    const unlighted = candidates.filter(medal => medal.isLighted === false)
+    const selectedMedal = unlighted.length ? shuffle(unlighted)[0] : candidates.find(medal => medal.roomId === ordered[0])
+    await assertSession(current, uid)
+    await setValue(STORAGE.queue(uid), ordered.filter(id => id !== selectedMedal?.roomId))
+    const selected = selectedMedal ? [selectedMedal] : []
+    for (const medal of selected) {
+      const sendAt = Date.now() + (immediate ? 0 : randomInt(CONFIG.roomDelayMinMs, CONFIG.roomDelayMaxMs))
+      await updateStatus(current, { uid, phase: 'delaying', current: medal.medalName || medal.roomId, sendAt })
+      await sleep(Math.max(0, sendAt - Date.now()), current.controller.signal)
       await assertSession(current, uid)
-      await updateStatus(current, { uid, phase: 'processing', current: `${index + 1}/${candidates.length} ${medal.medalName || medal.roomId}` })
+      await updateStatus(current, { uid, phase: 'processing', current: medal.medalName || medal.roomId })
       try {
         const outcome = await sendLike(current, uid, medal, clickTimes)
         summary[outcome] += 1
+        const name = medal.medalName || medal.roomId
+        if (outcome === 'accepted') lastResult = `已点赞：${name}`
+        else if (outcome === 'skipped') lastResult = `未发送：${name}，任务暂停或候选已被处理`
+        else {
+          const record = await getValue(STORAGE.room(uid, medal.roomId), null)
+          lastError = record?.lastError || '未返回详细原因'
+          lastResult = `${outcome === 'rejected' ? '点赞被拒绝' : '发送结果未知'}：${name}，${lastError}`
+        }
       } catch (error) {
         if (error instanceof LeadershipLostError || error instanceof AccountChangedError) throw error
         summary.failed += 1
+        lastError = error.message
+        lastResult = `处理失败：${medal.medalName || medal.roomId}，${error.message}`
         warn('处理直播间失败：', error)
       }
     }
-    await updateStatus(current, { uid, phase: 'idle', current: '', lastScanAt: scanStartedAt, lastSummary: summary })
-    if (summary.accepted > 0 && typeof GM_notification === 'function') {
-      GM_notification({ title: SCRIPT_NAME, text: `本轮成功发送 ${summary.accepted} 个，拒绝 ${summary.rejected} 个，结果未知 ${summary.unknown} 个`, timeout: 6_000 })
-    }
+    await updateStatus(current, { uid, phase: 'idle', current: '', sendAt: 0, lastScanAt: scanStartedAt, lastSummary: summary, lastResult, lastError })
     return summary
   }
 
@@ -366,6 +426,11 @@
         await waitForWork(CONFIG.pollIntervalMs, current.controller.signal)
         continue
       }
+      if (await getValue(STORAGE.paused(uid), false)) {
+        await updateStatus(current, { uid, phase: 'paused', current: '', nextScanAt: 0 })
+        await waitForWork(CONFIG.pollIntervalMs, current.controller.signal)
+        continue
+      }
       const key = STORAGE.schedule(uid)
       let schedule = await getValue(key, null)
       if (!schedule) {
@@ -379,14 +444,14 @@
         await waitForWork(Math.min(CONFIG.pollIntervalMs, schedule.nextScanAt - Date.now()), current.controller.signal)
         continue
       }
-      // 只确认本轮开始时看到的请求；扫描期间的新请求留给下一轮。
+      // 完成本轮后才确认请求；失去控制权时，接管者仍能继续处理未完成的请求。
       const acknowledgedRequest = request?.id ?? schedule.acknowledgedRequest
       await assertSession(current, uid)
-      await setValue(key, { ...schedule, acknowledgedRequest })
-      try { await runScan(current, uid) } catch (error) {
+      await setValue(key, { ...schedule, runningRequest: requested ? request.id : '' })
+      try { await runScan(current, uid, { immediate: Boolean(requested) }) } catch (error) {
         if (error instanceof LeadershipLostError) throw error
         if (!(error instanceof AccountChangedError)) {
-          await updateStatus(current, { uid, phase: 'error', current: '', lastError: error.message, lastScanAt: Date.now() })
+          await updateStatus(current, { uid, phase: 'error', current: '', sendAt: 0, lastError: error.message, lastResult: '未执行：' + error.message, lastScanAt: Date.now() })
           warn('扫描失败：', error)
         }
       }
@@ -449,48 +514,321 @@
 
   const requestScan = async () => {
     const uid = getUid()
-    if (!validId(uid)) { alert('请先登录 Bilibili'); return }
+    if (!validId(uid)) throw new Error('请先登录 Bilibili')
+    if (!getCookie('bili_jct')) throw new Error('登录凭据缺失，请重新登录 Bilibili')
+    if (await getValue(STORAGE.paused(uid), false)) throw new Error('任务已暂停，请先恢复')
+    const leader = selectLeader(await readPeers())
+    if (leader && leader.version !== SCRIPT_VERSION) {
+      throw new Error(`主控制标签页仍运行旧版，请刷新所有已打开的 B 站标签页：${leader.page}`)
+    }
     const request = { id: createId(), at: Date.now() }
     await setValue(STORAGE.request(uid), request)
     await setValue(STORAGE.signal, request)
     wakeWorker()
-    log('已保存扫描请求；24 小时冷却和结果未知的保护记录仍然有效')
+    log('已提交立即执行请求')
   }
-  const showStatus = async () => {
-    const status = await getValue(STORAGE.status, {})
+  let controls = null
+  let panelTimer = null
+  let panelSnapshot = null
+  let panelRefreshTask = null
+  let panelRefreshAgain = false
+  const watchedAccounts = new Set()
+  const watchedRooms = new Set()
+  let listFingerprint = ''
+  const panelIsOpen = () => controls && !controls.find('backdrop').hidden
+  const refreshOpenPanel = () => {
+    if (!panelIsOpen()) return
+    void refreshStatus().catch(error => {
+      if (panelIsOpen()) controls.find('message').textContent = error.message
+    })
+  }
+  const watchPanelAccount = uid => {
+    if (!validId(uid) || watchedAccounts.has(uid)) return
+    watchedAccounts.add(uid)
+    for (const key of [STORAGE.schedule(uid), STORAGE.request(uid), STORAGE.paused(uid), STORAGE.queue(uid), STORAGE.medals(uid)]) {
+      GM_addValueChangeListener(key, refreshOpenPanel)
+    }
+  }
+  const resolvePanelTheme = () => {
+    const surfaces = [document.body, document.documentElement].filter(Boolean)
+    for (const surface of surfaces) {
+      const marker = ['data-theme', 'data-color-mode', 'theme'].map(name => surface.getAttribute(name) ?? '').join(' ') + ` ${surface.className}`
+      if (/(?:^|[\s_-])(dark|night)(?:$|[\s_-])/i.test(marker)) return 'dark'
+      if (/(?:^|[\s_-])(light|day)(?:$|[\s_-])/i.test(marker)) return 'light'
+    }
+    // 页面实际背景优先于系统偏好，避免系统为深色但 B 站仍为浅色时配色不一致。
+    for (const surface of surfaces) {
+      const style = getComputedStyle(surface)
+      const rgb = style.backgroundColor.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+))?\s*\)$/)
+      if (rgb && (rgb[4] === undefined || Number(rgb[4]) >= 0.5)) {
+        const brightness = (0.2126 * Number(rgb[1]) + 0.7152 * Number(rgb[2]) + 0.0722 * Number(rgb[3])) / 255
+        return brightness < 0.5 ? 'dark' : 'light'
+      }
+      if (style.colorScheme === 'dark' || style.colorScheme === 'light') return style.colorScheme
+    }
+    return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  }
+  const mountControls = async () => {
+    if (controls) return controls
+    if (!document.documentElement) await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, { once: true }))
+    if (controls) return controls
+    const host = document.createElement('div')
+    host.style.cssText = 'position:fixed;z-index:2147483647'
+    const root = host.attachShadow({ mode: 'closed' })
+    root.innerHTML = `
+      <style>
+        :host{all:initial;font:14px/1.6 system-ui,sans-serif;--text:#202938;--surface:#fff;--border:#c5ceda;--button:#f0f3f7;--hover:#e2e9f1;--input:#fff;--muted:#526174;--accent:#006b9c;--focus:#008ac0;--overlay:#17253d55;color:var(--text);color-scheme:light}
+        :host([data-theme="dark"]){--text:#e8edf4;--surface:#182231;--border:#536075;--button:#263346;--hover:#35465e;--input:#101925;--muted:#bac6d5;--accent:#8fd9ff;--focus:#71cfff;--overlay:#0008;color-scheme:dark}
+        *{box-sizing:border-box} button,input{font:inherit} button{cursor:pointer;border:1px solid var(--border);border-radius:8px;padding:7px 12px;background:var(--button);color:var(--text)}
+        button:hover{background:var(--hover)} button:disabled{opacity:.5;cursor:default} button:focus-visible,input:focus-visible{outline:2px solid var(--focus)}
+        #backdrop{position:fixed;inset:0;background:var(--overlay);display:grid;place-items:center}
+        [hidden]{display:none!important} #panel{width:min(460px,calc(100vw - 32px));max-height:85vh;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 12px 48px #0004}
+        header{display:flex;align-items:center;justify-content:space-between;gap:12px} h2{font-size:18px;margin:0} #status{white-space:pre-wrap;overflow-wrap:anywhere;margin:16px 0;font:inherit}
+        .actions,form{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0} input{width:90px;padding:7px;border:1px solid var(--border);border-radius:6px;background:var(--input);color:var(--text)}
+        #panel:has(#medal-list:not([hidden])){width:min(1050px,calc(100vw - 32px))} #table-scroll{overflow:auto;max-height:45vh} table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:9px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top;min-width:110px;overflow-wrap:anywhere} th{position:sticky;top:0;background:var(--surface)} td small{display:block;color:var(--muted)} #list-time{font-size:12px;color:var(--muted)} #message{min-height:24px;color:var(--accent)} #close{padding:4px 10px}
+      </style>
+      <div id="backdrop" hidden>
+        <section id="panel" role="dialog" aria-modal="true" aria-labelledby="title" tabindex="-1">
+          <header><h2 id="title">粉丝勋章保活</h2><button id="close" aria-label="关闭">×</button></header>
+          <pre id="status">正在读取状态…</pre>
+          <div class="actions"><button id="pause">暂停任务</button><button id="scan">立即执行一次</button><button id="list-toggle" aria-expanded="false">查看勋章列表</button></div>
+          <form id="settings"><label for="clicks">单次点赞数</label><input id="clicks" type="number" min="1" max="3000" step="1" required><button type="submit">保存</button></form>
+          <section id="medal-list" hidden>
+            <div class="actions"><button id="list-refresh">刷新激活状态</button><span id="list-time"></span></div>
+            <div id="table-scroll"><table><thead><tr><th>勋章 / 主播</th><th>激活状态</th><th>处理状态</th><th>上次点赞</th><th>最近结果</th></tr></thead><tbody id="medal-rows"></tbody></table></div>
+            <p id="list-empty"></p>
+          </section>
+          <div id="message" role="status" aria-live="polite"></div>
+        </section>
+      </div>`
+    document.documentElement.append(host)
+    const find = id => root.getElementById(id)
+    const syncTheme = () => host.setAttribute('data-theme', resolvePanelTheme())
+    const themeObserver = new MutationObserver(syncTheme)
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      if (!find('backdrop').hidden) syncTheme()
+    })
+    controls = { find, previousFocus: null, syncTheme, themeObserver }
+    const action = async callback => {
+      try { await callback() } catch (error) { warn(error); find('message').textContent = error.message }
+    }
+    const close = () => {
+      find('backdrop').hidden = true
+      clearInterval(panelTimer)
+      panelTimer = null
+      themeObserver.disconnect()
+      controls.previousFocus?.focus()
+    }
+    find('close').addEventListener('click', close)
+    find('backdrop').addEventListener('click', event => { if (event.target === find('backdrop')) close() })
+    root.addEventListener('keydown', event => {
+      if (find('backdrop').hidden) return
+      if (event.key === 'Escape') { event.preventDefault(); close() }
+      if (event.key === 'Tab') {
+        const elements = [...find('panel').querySelectorAll('button,input')].filter(element => !element.disabled && element.getClientRects().length > 0)
+        const first = elements[0], last = elements.at(-1)
+        if (event.shiftKey && (root.activeElement === first || root.activeElement === find('panel'))) { event.preventDefault(); last.focus() }
+        else if (!event.shiftKey && root.activeElement === last) { event.preventDefault(); first.focus() }
+      }
+    })
+    find('pause').addEventListener('click', () => void action(async () => {
+      const uid = getUid()
+      if (!validId(uid)) throw new Error('请先登录 Bilibili')
+      const paused = !await getValue(STORAGE.paused(uid), false)
+      await setValue(STORAGE.paused(uid), paused)
+      await setValue(STORAGE.signal, { id: createId(), at: Date.now() })
+      wakeWorker()
+      find('message').textContent = paused ? '已暂停任务' : '已恢复任务'
+      await refreshStatus()
+    }))
+    find('scan').addEventListener('click', () => void action(async () => {
+      await requestScan()
+      find('message').textContent = '请求已提交'
+      await refreshStatus()
+    }))
+    find('list-toggle').addEventListener('click', () => void action(async () => {
+      const open = find('medal-list').hidden
+      find('medal-list').hidden = !open
+      find('list-toggle').textContent = open ? '收起勋章列表' : '查看勋章列表'
+      find('list-toggle').setAttribute('aria-expanded', String(open))
+      if (open) {
+        await refreshStatus()
+        await refreshMedalList()
+      }
+    }))
+    find('list-refresh').addEventListener('click', () => void action(refreshMedalList))
+    find('settings').addEventListener('submit', event => {
+      event.preventDefault()
+      void action(async () => {
+        const value = Number(find('clicks').value)
+        if (!Number.isInteger(value) || value < CONFIG.minClickTimes || value > CONFIG.maxClickTimes) throw new Error('请输入 1–3000 的整数')
+        await setValue(STORAGE.clickTimes, value)
+        find('message').textContent = `已保存单次点赞数：${value}`
+        await refreshStatus()
+      })
+    })
+    return controls
+  }
+  const refreshMedalList = async () => {
+    const { find } = controls
     const uid = getUid()
+    if (!validId(uid)) throw new Error('请先登录 Bilibili')
+    find('list-refresh').disabled = true
+    find('list-time').textContent = '正在读取激活状态…'
+    try {
+      const medals = await getAllMedals(null, uid)
+      if (getUid() !== uid) throw new AccountChangedError()
+      await setValue(STORAGE.medals(uid), { at: Date.now(), medals })
+      await refreshStatus()
+    } catch (error) {
+      find('list-time').textContent = '读取失败'
+      throw error
+    } finally { find('list-refresh').disabled = false }
+  }
+  const renderMedalList = () => {
+    if (!panelSnapshot || controls.find('medal-list').hidden) return
+    const { find } = controls
+    const { uid, roster, records, queue, paused } = panelSnapshot
+    const medals = roster?.medals ?? []
+    const queuePositions = new Map((Array.isArray(queue) ? queue : []).map((id, index) => [id, index + 1]))
+    const outcomeNames = { accepted: '已发送', rejected: '被拒绝', unknown: '结果未知', pending: '发送中 / 未确认', cancelled: '已取消', failed: '处理失败' }
+    const formatTime = value => value ? new Date(value).toLocaleString() : '未点赞过'
+    const rows = medals.map(medal => {
+      const record = records[medal.roomId]
+      const inactive = medal.isLighted === false
+      const due = isDueForLike(record, Date.now(), inactive)
+      const uncertain = ['pending', 'unknown'].includes(record?.outcome)
+      const eligibleAt = Math.max(!inactive ? Number(record?.lastSuccessAt || 0) + CONFIG.resendIntervalMs : 0,
+        uncertain ? Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs : 0)
+      const position = queuePositions.get(medal.roomId)
+      const state = !due ? uncertain ? '发送结果待确认' : '冷却中'
+        : inactive ? '优先处理' : position ? `队列第 ${position} 位` : '可进入随机队列'
+      return { medal, record, state: paused ? `已暂停 · ${state}` : state, eligibleAt: due ? 0 : eligibleAt }
+    })
+    const fingerprint = JSON.stringify([uid, roster?.at, rows])
+    if (fingerprint === listFingerprint) return
+    listFingerprint = fingerprint
+    find('list-time').textContent = roster?.at ? `激活状态读取于 ${new Date(roster.at).toLocaleString()}` : '尚未读取激活状态'
+    find('list-empty').textContent = medals.length ? '' : roster?.at ? '没有勋章' : '点击“刷新激活状态”读取列表'
+    const fragment = document.createDocumentFragment()
+    for (const { medal, record, state, eligibleAt } of rows) {
+      const row = document.createElement('tr')
+      const values = [
+        [medal.medalName || '未命名勋章', `${medal.anchorName || '主播'} · 房间 ${medal.roomId}`],
+        [medal.isLighted === false ? '未激活' : medal.isLighted === true ? '已激活' : '未知'],
+        [state, eligibleAt ? `可处理时间：${new Date(eligibleAt).toLocaleString()}` : ''],
+        [formatTime(record?.lastSuccessAt)],
+        [outcomeNames[record?.outcome] ?? '尚未处理', record?.lastError || ''],
+      ]
+      for (const [text, detail] of values) {
+        const cell = document.createElement('td')
+        cell.textContent = text
+        if (detail) { const small = document.createElement('small'); small.textContent = detail; cell.append(small) }
+        row.append(cell)
+      }
+      fragment.append(row)
+    }
+    find('medal-rows').replaceChildren(fragment)
+  }
+  const renderStatus = () => {
+    if (!panelIsOpen() || !panelSnapshot) return
+    const { find } = controls
+    controls.syncTheme()
+    const { uid, status, leader, paused, schedule, request, queue, clickTimes } = panelSnapshot
+    if (uid !== getUid()) { refreshOpenPanel(); return }
     const sameAccount = uid && status.uid === uid
     const summary = sameAccount ? status.lastSummary ?? {} : {}
-    const leader = selectLeader(await readPeers())
+    const busy = sameAccount && ['scanning', 'delaying', 'processing'].includes(status.phase)
+    const pendingRequest = request?.id && request.id !== schedule?.acknowledgedRequest
+    const phases = { scanning: '正在读取勋章并选择候选', delaying: '已选中勋章，等待发送', processing: '正在发送点赞', idle: '本轮完成', waiting: '等待下一轮', paused: '已暂停', 'login-required': '等待登录', error: '运行出错' }
     const formatTime = value => value ? new Date(value).toLocaleString() : '无'
-    alert([
-      SCRIPT_NAME,
-      `主控制者：${leader?.page ?? '等待选举'}`,
-      `状态：${sameAccount ? status.phase : '等待当前账号的状态'}`,
-      `下次扫描：${formatTime(sameAccount ? status.nextScanAt : 0)}`,
+    const countdown = value => {
+      const seconds = Math.max(0, Math.ceil((value - Date.now()) / 1000))
+      return `${Math.floor(seconds / 3600)} 小时 ${Math.floor(seconds % 3600 / 60)} 分 ${seconds % 60} 秒`
+    }
+    const nextAt = !paused && !busy ? schedule?.nextScanAt ?? 0 : 0
+    const leaderAlive = leader && leader.expiresAt > Date.now()
+    const outdatedLeader = leaderAlive && leader.version !== SCRIPT_VERSION
+    find('status').textContent = [
+      `主控制者：${leaderAlive ? leader.page : '等待选举或接管'}`,
+      `版本：界面 ${SCRIPT_VERSION} / 控制者 ${leaderAlive ? leader.version ?? '旧版（无版本登记）' : '等待选举'}`,
+      outdatedLeader ? '旧版控制者仍在运行，请刷新所有已打开的 B 站标签页。' : '',
+      `状态：${!validId(uid) ? '等待登录' : paused ? '已暂停' : !busy && pendingRequest ? '立即执行请求已排队' : sameAccount ? phases[status.phase] ?? status.phase : '等待当前账号的状态'}`,
+      `正在处理：${sameAccount && status.current ? status.current : '无'}`,
+      sameAccount && !paused && status.phase === 'delaying' ? `发送倒计时：${countdown(status.sendAt)}` : '',
+      `下次执行：${paused ? '已暂停' : busy ? '本轮结束后安排' : pendingRequest ? '尽快执行' : nextAt ? `${formatTime(nextAt)}（${nextAt > Date.now() ? `剩余 ${countdown(nextAt)}` : '等待控制者开始'}）` : '等待安排'}`,
       `上次扫描：${formatTime(sameAccount ? status.lastScanAt : 0)}`,
       `上轮：成功发送 ${summary.accepted ?? 0} / 拒绝 ${summary.rejected ?? 0} / 结果未知 ${summary.unknown ?? 0} / 处理失败 ${summary.failed ?? 0}`,
-      `点赞次数：${await getClickTimes()}`,
-      '成功发送后满 24 小时才再次入选；结果未知时也暂缓 24 小时。',
+      `上轮候选：${summary.candidates ?? 0}，勋章总数：${summary.totalMedals ?? 0}`,
+      `随机队列剩余：${Array.isArray(queue) ? queue.length : 0}`,
+      `点赞次数：${clickTimes}`,
+      sameAccount && status.lastResult ? `执行结果：${status.lastResult}` : '',
       sameAccount && status.lastError ? `最近错误：${status.lastError}` : '',
-    ].filter(Boolean).join('\n'))
+    ].filter(Boolean).join('\n')
+    find('pause').textContent = paused ? '恢复任务' : '暂停任务'
+    find('pause').disabled = !validId(uid)
+    find('scan').disabled = !validId(uid) || paused || busy || Boolean(pendingRequest)
+    find('scan').textContent = busy ? '正在执行' : pendingRequest ? '请求已排队' : '立即执行一次'
+    renderMedalList()
   }
-  const menu = (name, callback) => GM_registerMenuCommand(name, () => {
-    Promise.resolve().then(callback).catch(error => { warn(error); alert(error.message) })
-  })
-  menu('查看运行状态', showStatus)
-  menu('立即请求扫描', requestScan)
-  menu('设置单次点赞数', async () => {
-    const input = prompt(`请输入点赞次数（${CONFIG.minClickTimes}-${CONFIG.maxClickTimes}）：`, String(await getClickTimes()))
-    if (input === null) return
-    const value = Number(input)
-    if (!Number.isInteger(value) || value < CONFIG.minClickTimes || value > CONFIG.maxClickTimes) {
-      alert('输入无效，设置未更改。'); return
+  const refreshStatus = () => {
+    if (panelRefreshTask) { panelRefreshAgain = true; return panelRefreshTask }
+    panelRefreshTask = (async () => {
+      do {
+        panelRefreshAgain = false
+        const uid = getUid()
+        watchPanelAccount(uid)
+        const [status, peers, paused, schedule, request, queue, clickTimes, roster] = await Promise.all([
+          getValue(STORAGE.status, {}), readPeers(),
+          validId(uid) ? getValue(STORAGE.paused(uid), false) : false,
+          validId(uid) ? getValue(STORAGE.schedule(uid), null) : null,
+          validId(uid) ? getValue(STORAGE.request(uid), null) : null,
+          validId(uid) ? getValue(STORAGE.queue(uid), []) : [], getClickTimes(),
+          validId(uid) ? getValue(STORAGE.medals(uid), null) : null,
+        ])
+        if (uid !== getUid()) { panelRefreshAgain = true; continue }
+        const records = {}
+        if (!controls.find('medal-list').hidden) {
+          await Promise.all((roster?.medals ?? []).map(async medal => {
+            const key = STORAGE.room(uid, medal.roomId)
+            if (!watchedRooms.has(key)) { watchedRooms.add(key); GM_addValueChangeListener(key, refreshOpenPanel) }
+            records[medal.roomId] = await getValue(key, null)
+          }))
+        }
+        if (uid !== getUid()) { panelRefreshAgain = true; continue }
+        panelSnapshot = { uid, status, leader: selectLeader(peers), paused, schedule, request, queue, clickTimes, roster, records }
+        renderStatus()
+      } while (panelRefreshAgain && panelIsOpen())
+    })().finally(() => { panelRefreshTask = null })
+    return panelRefreshTask
+  }
+  const showStatus = async () => {
+    const { find } = await mountControls()
+    if (find('backdrop').hidden) {
+      controls.previousFocus = document.activeElement
+      find('backdrop').hidden = false
+      const options = { attributes: true, attributeFilter: ['class', 'style', 'data-theme', 'data-color-mode', 'theme'] }
+      controls.themeObserver.observe(document.documentElement, options)
+      if (document.body) controls.themeObserver.observe(document.body, options)
+      find('clicks').value = String(await getClickTimes())
+      find('message').textContent = ''
+      find('panel').focus()
     }
-    await setValue(STORAGE.clickTimes, value)
-    alert(`已将单次点赞数设置为 ${value}。`)
+    await refreshStatus()
+    let lastReadAt = Date.now()
+    if (panelIsOpen() && !panelTimer) panelTimer = setInterval(() => {
+      renderStatus()
+      // 存储变化即时刷新；定时读取仅用于发现账号、标签页和控制者的变化。
+      if (Date.now() - lastReadAt >= 5_000) { lastReadAt = Date.now(); refreshOpenPanel() }
+    }, 1_000)
+  }
+  GM_registerMenuCommand('打开勋章保活控制面板', () => {
+    void showStatus().catch(error => { warn(error); if (controls) controls.find('message').textContent = error.message })
   })
   GM_addValueChangeListener(STORAGE.signal, () => wakeWorker())
+  for (const key of [STORAGE.status, STORAGE.clickTimes, STORAGE.signal]) {
+    GM_addValueChangeListener(key, refreshOpenPanel)
+  }
   addEventListener('pagehide', () => {
     stopped = true
     loseSession()
