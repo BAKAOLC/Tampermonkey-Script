@@ -1,9 +1,9 @@
 // ==UserScript==
 // @license     MIT
 // @name        Bilibili 粉丝勋章自动保活
-// @description 每隔 20–45 分钟按洗牌队列选择一个 24 小时内未点赞的勋章，未点赞过的优先，未激活的临时优先；页面内管理和控制。
+// @description 按随机队列为开播房间点赞，未激活优先；读取任务、签名请求并复查点亮结果，通过油猴菜单管理。
 // @author      BAKAOLC
-// @version     1.3.5
+// @version     1.4.0
 // @match       https://*.bilibili.com/*
 // @match       https://bilibili.com/*
 // @namespace   none
@@ -16,6 +16,7 @@
 // @grant       GM_addValueChangeListener
 // @grant       GM_xmlhttpRequest
 // @connect     api.live.bilibili.com
+// @connect     api.bilibili.com
 // @run-at      document-start
 // @supportURL  https://github.com/BAKAOLC/Tampermonkey-Script
 // @homepageURL https://github.com/BAKAOLC/Tampermonkey-Script
@@ -26,7 +27,7 @@
   'use strict'
 
   const SCRIPT_NAME = '粉丝勋章自动保活'
-  const SCRIPT_VERSION = '1.3.5'
+  const SCRIPT_VERSION = '1.4.0'
   const API_BASE = 'https://api.live.bilibili.com'
   const CONFIG = Object.freeze({
     defaultClickTimes: 30,
@@ -48,6 +49,9 @@
     requestTimeoutMs: 20_000,
     storageTimeoutMs: 10_000,
     getRetries: 1,
+    retryBaseMs: 60 * 60_000,
+    retryMaxMs: 12 * 60 * 60_000,
+    verifyDelaysMs: [3_000, 8_000],
   })
   const STORAGE = Object.freeze({
     peer: 'bmkCoordinatorV2',
@@ -195,8 +199,8 @@
     timer = setTimeout(timeout, CONFIG.requestTimeoutMs)
     try {
       handle = GM_xmlhttpRequest({
-        method: init.method ?? 'GET', url: `${API_BASE}${path}`, data: init.body,
-        headers: init.headers, timeout: CONFIG.requestTimeoutMs, nocache: true,
+        method: init.method ?? 'GET', url: `${init.base ?? API_BASE}${path}`, data: init.body,
+        headers: { Referer: 'https://live.bilibili.com/', Origin: 'https://live.bilibili.com', ...init.headers }, timeout: CONFIG.requestTimeoutMs, nocache: true,
         anonymous: false,
         onload: response => {
           let json
@@ -229,6 +233,77 @@
     }
   }
 
+
+  // WBI 的摘要输入由 URL 编码参数组成；本地计算，不加载第三方脚本。
+  const md5 = value => {
+    const bytes = new TextEncoder().encode(value)
+    const length = Math.ceil((bytes.length + 9) / 64) * 64
+    const buffer = new Uint8Array(length)
+    buffer.set(bytes); buffer[bytes.length] = 0x80
+    const view = new DataView(buffer.buffer)
+    view.setUint32(length - 8, bytes.length * 8, true)
+    view.setUint32(length - 4, Math.floor(bytes.length / 0x20000000), true)
+    const shifts = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21]
+    const constants = Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0)
+    let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476
+    for (let offset = 0; offset < length; offset += 64) {
+      let a = h0, b = h1, c = h2, d = h3
+      for (let i = 0; i < 64; i += 1) {
+        let f, index
+        if (i < 16) { f = (b & c) | (~b & d); index = i }
+        else if (i < 32) { f = (d & b) | (~d & c); index = (5 * i + 1) % 16 }
+        else if (i < 48) { f = b ^ c ^ d; index = (3 * i + 5) % 16 }
+        else { f = c ^ (b | ~d); index = (7 * i) % 16 }
+        const sum = (a + f + constants[i] + view.getUint32(offset + index * 4, true)) >>> 0
+        const shift = shifts[Math.floor(i / 16) * 4 + i % 4]
+        const rotated = (sum << shift) | (sum >>> (32 - shift))
+        ;[a, b, c, d] = [d, (b + rotated) >>> 0, b, c]
+      }
+      h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0
+    }
+    return [h0, h1, h2, h3].map(word => [0, 8, 16, 24]
+      .map(shift => ((word >>> shift) & 255).toString(16).padStart(2, '0')).join('')).join('')
+  }
+  let wbiCache = null
+  const signWbi = async (current, uid, params) => {
+    if (!wbiCache || wbiCache.until <= Date.now()) {
+      const data = await apiRequest(current, uid, '/x/web-interface/nav', {
+        base: 'https://api.bilibili.com', headers: { Referer: 'https://www.bilibili.com/', Origin: 'https://www.bilibili.com' },
+      })
+      const key = url => String(url ?? '').split('/').at(-1)?.split('.')[0] ?? ''
+      const raw = key(data.wbi_img?.img_url) + key(data.wbi_img?.sub_url)
+      if (!/^[a-f\d]{64}$/i.test(raw)) throw new Error('无法获取 WBI 签名密钥')
+      const order = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13]
+      wbiCache = { key: order.map(index => raw[index]).join(''), until: Date.now() + 6 * 60 * 60_000 }
+    }
+    const values = { ...params, wts: Math.floor(Date.now() / 1000) }
+    const query = Object.keys(values).sort().map(key =>
+      `${encodeURIComponent(key)}=${encodeURIComponent(String(values[key]).replace(/[!'()*]/g, ''))}`).join('&')
+    return `${query}&w_rid=${md5(query + wbiCache.key)}`
+  }
+  const readMedalTask = (current, uid, anchorId) => apiRequest(current, uid,
+    `/xlive/app-ucenter/v1/fansMedal/GetActivatedMedalInfo?${new URLSearchParams({
+      target_id: anchorId, csrf: getCookie('bili_jct'), web_location: '444.260',
+    })}`)
+  const readLighted = data => data?.is_lighted === undefined || data?.is_lighted === null
+    ? null : [true, 1, '1'].includes(data.is_lighted)
+  const deferRoom = async (current, uid, medal, reason, outcome = 'deferred') => {
+    await assertSession(current, uid)
+    const key = STORAGE.room(uid, medal.roomId)
+    const previous = await getValue(key, null)
+    const failures = Math.min(5, Number(previous?.failureCount || 0) + 1)
+    await setValue(key, { ...previous, outcome: ['pending', 'unknown'].includes(previous?.outcome) ? previous.outcome : outcome, failureCount: failures, lastError: reason,
+      nextAttemptAt: Date.now() + Math.min(CONFIG.retryMaxMs, CONFIG.retryBaseMs * 2 ** (failures - 1)) })
+    return 'deferred'
+  }
+  const updateObservedMedal = async (current, uid, roomId, isLighted) => {
+    await assertSession(current, uid)
+    const roster = await getValue(STORAGE.medals(uid), null)
+    if (!roster || isLighted === null) return
+    await setValue(STORAGE.medals(uid), { ...roster, medals: roster.medals.map(medal =>
+      medal.roomId === roomId ? { ...medal, isLighted, lightCheckedAt: Date.now() } : medal) })
+  }
+
   const getAllMedals = async (current, uid) => {
     const medals = new Map()
     for (let page = 1; page <= CONFIG.maxPages; page += 1) {
@@ -253,6 +328,7 @@
           medalName: String(medal.medal_name ?? medal.name ?? ''),
           anchorName: String(anchor.nick_name ?? anchor.uname ?? ''),
           isLighted: medal.is_lighted == null ? null : Number(medal.is_lighted) === 1,
+          liveStatus: room.living_status == null ? null : Number(room.living_status),
         })
       }
       const totalPages = Number(data.page_info?.total_page ?? 0)
@@ -270,65 +346,99 @@
   }
   const isDueForLike = (record, now = Date.now(), inactive = false) => {
     if (!record) return true
+    if (Number(record.nextAttemptAt) > now) return false
     if (!inactive && Number(record.lastSuccessAt) > 0 && Number(record.lastSuccessAt) + CONFIG.resendIntervalMs > now) return false
     return !['pending', 'unknown'].includes(record.outcome) ||
       Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs <= now
   }
-  const resolveAnchorId = async (current, uid, medal) => {
-    if (validId(medal.targetId)) return medal.targetId
-    const info = await apiRequest(current, uid,
-      `/xlive/web-room/v1/index/getInfoByUser?room_id=${encodeURIComponent(medal.roomId)}`)
-    const worn = info?.medal?.curr_weared
-    // 佩戴勋章未必属于当前直播间，只有勋章 ID 匹配时才采用其主播 UID。
-    if (medal.medalId && String(worn?.medal_id ?? worn?.id ?? '') === medal.medalId && validId(worn?.target_id)) {
-      return String(worn.target_id)
-    }
-    throw new Error(`直播间 ${medal.roomId} 缺少可确认的主播 UID`)
-  }
   const sendLike = async (current, uid, medal, clickTimes) => {
     if (await getValue(STORAGE.paused(uid), false)) return 'skipped'
-    const anchorId = await resolveAnchorId(current, uid, medal)
-    await assertSession(current, uid)
+    const roomQuery = await signWbi(current, uid, { room_id: medal.roomId, web_location: '444.8' })
+    const roomData = await apiRequest(current, uid, `/xlive/web-room/v1/index/getInfoByRoom?${roomQuery}`)
+    if (roomData.room_info?.live_status == null) return deferRoom(current, uid, medal, '无法确认房间开播状态')
+    if (Number(roomData.room_info.live_status) !== 1) {
+      return deferRoom(current, uid, medal, '未开播，等待开播后点赞')
+    }
+    const anchorId = validId(roomData.room_info?.uid) ? String(roomData.room_info.uid) : medal.targetId
+    if (!validId(anchorId)) return deferRoom(current, uid, medal, '无法确认主播 UID')
+    if (validId(medal.targetId) && anchorId !== medal.targetId) {
+      return deferRoom(current, uid, medal, '直播间主播与勋章不匹配')
+    }
+    const taskData = await readMedalTask(current, uid, anchorId)
+    const lightedBefore = readLighted(taskData)
+    await updateObservedMedal(current, uid, medal.roomId, lightedBefore)
+    const task = Array.isArray(taskData.task_info) ? taskData.task_info.find(item => item.jump_type === 'like') : null
+    if (!task) return deferRoom(current, uid, medal, '该勋章没有可用的点赞任务')
+    if ([true, 1, '1'].includes(task.is_done)) return deferRoom(current, uid, medal, '点赞任务已完成，暂不重复发送')
+    const required = Number(String(task.title ?? '').match(/(\d+)\s*次/)?.[1] ?? 30)
+    const count = Math.max(clickTimes, required)
+    if (!Number.isInteger(count) || count < 1 || count > CONFIG.maxClickTimes) {
+      return deferRoom(current, uid, medal, '任务要求的点赞次数超出可处理范围')
+    }
     const csrf = getCookie('bili_jct')
     if (!csrf) throw new Error('未检测到登录凭据，请先登录 Bilibili')
+    const query = await signWbi(current, uid, { click_time: count, room_id: medal.roomId,
+      anchor_id: anchorId, uid, csrf, web_location: '444.8' })
     const key = STORAGE.room(uid, medal.roomId)
     const previous = await getValue(key, null)
-    if (!isDueForLike(previous, Date.now(), medal.isLighted === false)) return 'skipped'
-    const record = {
-      lastSuccessAt: previous?.lastSuccessAt ?? 0,
-      attemptedAt: Date.now(), attemptId: createId(), term: current.term,
-      outcome: 'pending', medalName: medal.medalName, anchorName: medal.anchorName,
-    }
-    // 先持久化，再发送。页面关闭或响应丢失时，下一个任期仍能看到这次尝试。
+    const inactive = lightedBefore === false || (lightedBefore === null && medal.isLighted === false)
+    if (!isDueForLike(previous, Date.now(), inactive)) return 'skipped'
+    if (await getValue(STORAGE.paused(uid), false)) return 'skipped'
+    const record = { ...previous, lastSuccessAt: previous?.lastSuccessAt ?? 0,
+      attemptedAt: Date.now(), attemptId: createId(), term: current.term, outcome: 'pending',
+      verification: '', wasLighted: lightedBefore, lastError: '', clickTimes: count, medalName: medal.medalName, anchorName: medal.anchorName }
     await assertSession(current, uid)
     await setValue(key, record)
-    const saved = await getValue(key, null)
-    if (saved?.attemptId !== record.attemptId) throw new LeadershipLostError()
+    if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
     await assertSession(current, uid)
     if (await getValue(STORAGE.paused(uid), false)) {
       await setValue(key, { ...record, outcome: 'cancelled' })
       return 'skipped'
     }
-    const body = new URLSearchParams({ click_time: String(clickTimes), room_id: medal.roomId,
-      anchor_id: anchorId, uid, csrf_token: csrf, csrf, visit_id: '' }).toString()
     try {
-      await apiRequest(current, uid, '/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3', {
-        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body,
+      await apiRequest(current, uid, `/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3?${query}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: '',
       })
     } catch (error) {
       if (error instanceof LeadershipLostError || error instanceof AccountChangedError) throw error
       await assertSession(current, uid)
-      const latest = await getValue(key, null)
-      if (latest?.attemptId !== record.attemptId) throw new LeadershipLostError()
-      await setValue(key, { ...record, outcome: error.rejected ? 'rejected' : 'unknown', lastError: error.message })
-      warn(`${medal.medalName || medal.roomId}：${error.message}`)
+      if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
+      if (error.rejected) wbiCache = null
+      const failures = Math.min(5, Number(previous?.failureCount || 0) + 1)
+      await setValue(key, { ...record, outcome: error.rejected ? 'rejected' : 'unknown',
+        lastError: error.message, failureCount: failures,
+        nextAttemptAt: Date.now() + (error.rejected
+          ? Math.min(CONFIG.retryMaxMs, CONFIG.retryBaseMs * 2 ** (failures - 1)) : CONFIG.resendIntervalMs) })
       return error.rejected ? 'rejected' : 'unknown'
     }
-    // 失去任期后不回写旧结果；发送前的 pending 记录会继续阻止立即补发。
+    const accepted = { ...record, outcome: 'accepted', lastSuccessAt: Date.now(),
+      verification: 'checking', nextAttemptAt: Date.now() + CONFIG.retryBaseMs }
     await assertSession(current, uid)
     if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
-    await setValue(key, { ...record, outcome: 'accepted', lastSuccessAt: Date.now(), lastError: '' })
-    log(`点赞 API 已接受 ${medal.medalName || medal.roomId}`)
+    await setValue(key, accepted)
+    await updateStatus(current, { uid, phase: 'verifying', current: medal.medalName || medal.roomId, sendAt: 0 })
+    let lightedAfter = null, verificationError = ''
+    for (const delay of CONFIG.verifyDelaysMs) {
+      await sleep(delay, current.controller.signal)
+      try {
+        const data = await readMedalTask(current, uid, anchorId)
+        lightedAfter = readLighted(data)
+        verificationError = ''
+        await updateObservedMedal(current, uid, medal.roomId, lightedAfter)
+        if (lightedAfter === true) break
+      } catch (error) {
+        if (error instanceof LeadershipLostError || error instanceof AccountChangedError) throw error
+        lightedAfter = null
+        verificationError = error.message
+      }
+    }
+    await assertSession(current, uid)
+    if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
+    const failures = lightedAfter === true ? 0 : Math.min(5, Number(previous?.failureCount || 0) + 1)
+    await setValue(key, { ...accepted, checkedAt: Date.now(), failureCount: failures,
+      verification: lightedAfter === true ? 'lighted' : lightedAfter === false ? 'unlit' : 'unconfirmed',
+      lastError: lightedAfter === true ? '' : lightedAfter === false ? '点赞已发送，但勋章仍未点亮' : `点赞已发送，无法确认点亮状态${verificationError ? `：${verificationError}` : ''}`,
+      nextAttemptAt: lightedAfter === true ? 0 : Date.now() + Math.min(CONFIG.retryMaxMs, CONFIG.retryBaseMs * 2 ** (failures - 1)) })
     return 'accepted'
   }
   const runScan = async (current, uid, { immediate = false } = {}) => {
@@ -341,23 +451,27 @@
     const neverLiked = new Set()
     let cooling = 0
     let uncertain = 0
+    let offline = 0
+    let delayed = 0
     let earliestEligibleAt = Infinity
     for (const medal of medals) {
       const record = await getValue(STORAGE.room(uid, medal.roomId), null)
+      if (medal.liveStatus !== null && medal.liveStatus !== 1) { offline += 1; continue }
       if (!isDueForLike(record, Date.now(), medal.isLighted === false)) {
-        const successDueAt = Number(record?.lastSuccessAt || 0) + CONFIG.resendIntervalMs
+        const successDueAt = medal.isLighted === false ? 0 : Number(record?.lastSuccessAt || 0) + CONFIG.resendIntervalMs
         const uncertainDueAt = ['pending', 'unknown'].includes(record?.outcome) ? Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs : 0
-        earliestEligibleAt = Math.min(earliestEligibleAt, Math.max(successDueAt, uncertainDueAt))
+        earliestEligibleAt = Math.min(earliestEligibleAt, Math.max(successDueAt, uncertainDueAt, Number(record?.nextAttemptAt || 0)))
         if (uncertainDueAt > Date.now()) uncertain += 1
+        else if (Number(record?.nextAttemptAt) > Date.now()) delayed += 1
         else cooling += 1
         continue
       }
       candidates.push(medal)
       if (!(Number(record?.lastSuccessAt) > 0)) neverLiked.add(medal.roomId)
     }
-    const summary = { totalMedals: medals.length, candidates: candidates.length, cooling, uncertain, accepted: 0, rejected: 0, unknown: 0, failed: 0, skipped: 0 }
+    const summary = { totalMedals: medals.length, candidates: candidates.length, cooling, uncertain, offline, delayed, accepted: 0, confirmed: 0, unlit: 0, unconfirmed: 0, deferred: 0, rejected: 0, unknown: 0, failed: 0, skipped: 0 }
     let lastResult = candidates.length ? '' : medals.length
-      ? `暂无候选：${cooling} 个近期已点赞，${uncertain} 个发送结果待确认；最早可处理时间：${new Date(earliestEligibleAt).toLocaleString()}`
+      ? `暂无候选：${offline} 个未开播，${cooling} 个冷却中，${delayed} 个暂缓重试，${uncertain} 个结果待确认${Number.isFinite(earliestEligibleAt) ? `；最早重试：${new Date(earliestEligibleAt).toLocaleString()}` : ''}`
       : '账号没有可处理的勋章'
     let lastError = ''
     await updateStatus(current, { uid, lastSummary: summary, lastResult })
@@ -385,7 +499,18 @@
         const outcome = await sendLike(current, uid, medal, clickTimes)
         summary[outcome] += 1
         const name = medal.medalName || medal.roomId
-        if (outcome === 'accepted') lastResult = `已点赞：${name}`
+        if (outcome === 'accepted') {
+          const saved = await getValue(STORAGE.room(uid, medal.roomId), null)
+          if (saved?.verification === 'lighted') { summary.confirmed += 1; lastResult = `${saved.wasLighted === true ? '已发送，确认勋章已激活' : '已发送并确认点亮'}：${name}` }
+          else {
+            summary[saved?.verification === 'unlit' ? 'unlit' : 'unconfirmed'] += 1
+            lastResult = `${name}：${saved?.lastError || '点赞已发送，点亮状态待确认'}`
+          }
+        }
+        else if (outcome === 'deferred') {
+          const saved = await getValue(STORAGE.room(uid, medal.roomId), null)
+          lastResult = `暂缓处理：${name}，${saved?.lastError || '稍后重试'}`
+        }
         else if (outcome === 'skipped') lastResult = `未发送：${name}，任务暂停或候选已被处理`
         else {
           const record = await getValue(STORAGE.room(uid, medal.roomId), null)
@@ -395,6 +520,8 @@
       } catch (error) {
         if (error instanceof LeadershipLostError || error instanceof AccountChangedError) throw error
         summary.failed += 1
+        if (error.rejected) wbiCache = null
+        await deferRoom(current, uid, medal, error.message, 'failed')
         lastError = error.message
         lastResult = `处理失败：${medal.medalName || medal.roomId}，${error.message}`
         warn('处理直播间失败：', error)
@@ -691,7 +818,7 @@
     const { uid, roster, records, queue, paused } = panelSnapshot
     const medals = roster?.medals ?? []
     const queuePositions = new Map((Array.isArray(queue) ? queue : []).map((id, index) => [id, index + 1]))
-    const outcomeNames = { accepted: '已发送', rejected: '被拒绝', unknown: '结果未知', pending: '发送中 / 未确认', cancelled: '已取消', failed: '处理失败' }
+    const outcomeNames = { deferred: '暂缓处理', accepted: '已发送', rejected: '被拒绝', unknown: '结果未知', pending: '发送中 / 未确认', cancelled: '已取消', failed: '处理失败' }
     const formatTime = value => value ? new Date(value).toLocaleString() : '未点赞过'
     const rows = medals.map(medal => {
       const record = records[medal.roomId]
@@ -699,9 +826,10 @@
       const due = isDueForLike(record, Date.now(), inactive)
       const uncertain = ['pending', 'unknown'].includes(record?.outcome)
       const eligibleAt = Math.max(!inactive ? Number(record?.lastSuccessAt || 0) + CONFIG.resendIntervalMs : 0,
-        uncertain ? Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs : 0)
+        uncertain ? Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs : 0, Number(record?.nextAttemptAt || 0))
       const position = queuePositions.get(medal.roomId)
-      const state = !due ? uncertain ? '发送结果待确认' : '冷却中'
+      const state = medal.liveStatus !== null && medal.liveStatus !== 1 ? '未开播，等待开播'
+        : !due ? uncertain ? '发送结果待确认' : Number(record?.nextAttemptAt) > Date.now() ? '暂缓重试' : '冷却中'
         : inactive ? '优先处理' : position ? `队列第 ${position} 位` : '可进入随机队列'
       return { medal, record, state: paused ? `已暂停 · ${state}` : state, eligibleAt: due ? 0 : eligibleAt }
     })
@@ -715,10 +843,10 @@
       const row = document.createElement('tr')
       const values = [
         [medal.medalName || '未命名勋章', `${medal.anchorName || '主播'} · 房间 ${medal.roomId}`],
-        [medal.isLighted === false ? '未激活' : medal.isLighted === true ? '已激活' : '未知'],
+        [medal.isLighted === false ? '未激活' : medal.isLighted === true ? '已激活' : '未知', medal.lightCheckedAt ? `复查于 ${new Date(medal.lightCheckedAt).toLocaleString()}` : ''],
         [state, eligibleAt ? `可处理时间：${new Date(eligibleAt).toLocaleString()}` : ''],
         [formatTime(record?.lastSuccessAt)],
-        [outcomeNames[record?.outcome] ?? '尚未处理', record?.lastError || ''],
+        [record?.outcome !== 'accepted' ? outcomeNames[record?.outcome] ?? '尚未处理' : record?.verification === 'lighted' ? '已确认点亮' : record?.verification === 'unlit' ? '已发送，仍未点亮' : record?.verification === 'unconfirmed' ? '已发送，未能确认' : record?.verification === 'checking' ? '已发送，正在确认' : outcomeNames[record?.outcome] ?? '尚未处理', record?.lastError || ''],
       ]
       for (const [text, detail] of values) {
         const cell = document.createElement('td')
@@ -738,9 +866,9 @@
     if (uid !== getUid()) { refreshOpenPanel(); return }
     const sameAccount = uid && status.uid === uid
     const summary = sameAccount ? status.lastSummary ?? {} : {}
-    const busy = sameAccount && ['scanning', 'delaying', 'processing'].includes(status.phase)
+    const busy = sameAccount && ['scanning', 'delaying', 'processing', 'verifying'].includes(status.phase)
     const pendingRequest = request?.id && request.id !== schedule?.acknowledgedRequest
-    const phases = { scanning: '正在读取勋章并选择候选', delaying: '已选中勋章，等待发送', processing: '正在发送点赞', idle: '本轮完成', waiting: '等待下一轮', paused: '已暂停', 'login-required': '等待登录', error: '运行出错' }
+    const phases = { scanning: '正在读取勋章并选择候选', delaying: '已选中勋章，等待发送', processing: '正在发送点赞', verifying: '正在确认点亮状态', idle: '本轮完成', waiting: '等待下一轮', paused: '已暂停', 'login-required': '等待登录', error: '运行出错' }
     const formatTime = value => value ? new Date(value).toLocaleString() : '无'
     const countdown = value => {
       const seconds = Math.max(0, Math.ceil((value - Date.now()) / 1000))
@@ -759,7 +887,8 @@
       `下次执行：${paused ? '已暂停' : busy ? '本轮结束后安排' : pendingRequest ? '尽快执行' : nextAt ? `${formatTime(nextAt)}（${nextAt > Date.now() ? `剩余 ${countdown(nextAt)}` : '等待控制者开始'}）` : '等待安排'}`,
       `上次扫描：${formatTime(sameAccount ? status.lastScanAt : 0)}`,
       `上轮：成功发送 ${summary.accepted ?? 0} / 拒绝 ${summary.rejected ?? 0} / 结果未知 ${summary.unknown ?? 0} / 处理失败 ${summary.failed ?? 0}`,
-      `上轮候选：${summary.candidates ?? 0}，勋章总数：${summary.totalMedals ?? 0}`,
+      `点亮复查：已确认 ${summary.confirmed ?? 0} / 仍未点亮 ${summary.unlit ?? 0} / 无法确认 ${summary.unconfirmed ?? 0}`,
+      `上轮候选：${summary.candidates ?? 0}，勋章总数：${summary.totalMedals ?? 0}，暂缓处理：${summary.deferred ?? 0}`,
       `随机队列剩余：${Array.isArray(queue) ? queue.length : 0}`,
       `点赞次数：${clickTimes}`,
       sameAccount && status.lastResult ? `执行结果：${status.lastResult}` : '',
