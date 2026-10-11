@@ -1,9 +1,9 @@
 // ==UserScript==
 // @license     MIT
 // @name        Bilibili 粉丝勋章自动保活
-// @description 按随机队列为开播房间点赞，未激活优先；读取任务、签名请求并复查点亮结果，通过油猴菜单管理。
+// @description 按随机队列点赞，未激活优先；未开播时使用可用表情和颜文字弹幕点亮，发送后复查，通过油猴菜单管理。
 // @author      BAKAOLC
-// @version     1.4.0
+// @version     1.5.0
 // @match       https://*.bilibili.com/*
 // @match       https://bilibili.com/*
 // @namespace   none
@@ -27,7 +27,7 @@
   'use strict'
 
   const SCRIPT_NAME = '粉丝勋章自动保活'
-  const SCRIPT_VERSION = '1.4.0'
+  const SCRIPT_VERSION = '1.5.0'
   const API_BASE = 'https://api.live.bilibili.com'
   const CONFIG = Object.freeze({
     defaultClickTimes: 30,
@@ -52,12 +52,16 @@
     retryBaseMs: 60 * 60_000,
     retryMaxMs: 12 * 60 * 60_000,
     verifyDelaysMs: [3_000, 8_000],
+    danmakuDelayMinMs: 20_000,
+    danmakuDelayMaxMs: 40_000,
+    maxDanmakuPerRound: 20,
   })
   const STORAGE = Object.freeze({
     peer: 'bmkCoordinatorV2',
     status: 'bmk:status:v2',
     signal: 'bmk:signal:v2',
     clickTimes: 'bmk:click-times:v1',
+    danmakuEnabled: 'bmk:danmaku-enabled:v1',
     room: (uid, roomId) => `bmk:room:v2:${uid}:${roomId}`,
     schedule: uid => `bmk:schedule:v2:${uid}`,
     request: uid => `bmk:request:v2:${uid}`,
@@ -214,6 +218,8 @@
             finish(new ApiError('API 响应缺少有效的 code'))
           } else if (json.code !== 0) {
             finish(new ApiError(`${json.message || json.msg || '请求被拒绝'} (code: ${json.code})`, { rejected: true }))
+          } else if (init.danmaku && json.msg !== undefined && json.msg !== '') {
+            finish(new ApiError(json.msg === 'k' ? '弹幕包含屏蔽内容' : json.msg === 'f' ? '弹幕被过滤' : `弹幕未通过：${json.msg}`, { rejected: true }))
           } else finish(null, json.data ?? json.result ?? {})
         },
         onerror: () => finish(new ApiError('网络请求失败，结果未知', { retryable: true })),
@@ -351,14 +357,61 @@
     return !['pending', 'unknown'].includes(record.outcome) ||
       Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs <= now
   }
-  const sendLike = async (current, uid, medal, clickTimes) => {
+
+  const KAOMOJI = ['(⌒▽⌒)', '(=・ω・=)', '(･∀･)', '(°∀°)ﾉ', '(●￣(ｴ)￣●)', '(｀・ω・´)', '(〜￣△￣)〜', '(^・ω・^ )', '(￣▽￣)', 'ヾ(≧▽≦*)o', '(｡･ω･｡)', '(๑•̀ㅂ•́)و✧']
+  const getDanmakuChoices = async (current, uid, roomId, anchorId) => {
+    const choices = []
+    try {
+      const data = await apiRequest(current, uid,
+        `/xlive/web-ucenter/v2/emoticon/GetEmoticons?platform=pc&room_id=${encodeURIComponent(roomId)}`)
+      for (const pkg of Array.isArray(data.data) ? data.data : []) {
+        for (const item of Array.isArray(pkg.emoticons) ? pkg.emoticons : []) {
+          if (Number(item.perm) !== 1) continue
+          const unique = String(item.emoticon_unique ?? '')
+          const text = String(item.emoji ?? '')
+          const isText = Number(pkg.pkg_id) === 100
+          if (isText ? !text : !unique) continue
+          const relatedRoom = unique.startsWith(`room_${roomId}_`)
+          const relatedAnchor = unique.startsWith(`room_${anchorId}_`) || [pkg.uid, pkg.ruid, pkg.target_id].some(id => String(id) === anchorId)
+          choices.push({ msg: isText ? text : unique, image: !isText, label: text || pkg.pkg_name || '表情',
+            source: relatedRoom ? '房间表情' : relatedAnchor ? '主播表情' : '可用表情',
+            priority: relatedRoom ? 0 : relatedAnchor ? 1 : 2 })
+        }
+      }
+    } catch (error) {
+      if (error instanceof LeadershipLostError || error instanceof AccountChangedError) throw error
+      warn('读取表情失败，使用颜文字：', error.message)
+    }
+    choices.push(...KAOMOJI.map(msg => ({ msg, image: false, label: msg, source: '颜文字', priority: 3 })))
+    const seen = new Set()
+    return shuffle(choices).filter(choice => {
+      const key = `${choice.image}:${choice.msg}`
+      if (seen.has(key)) return false
+      seen.add(key); return true
+    }).sort((a, b) => a.priority - b.priority)
+  }
+  const sendDanmakuMessage = async (current, uid, roomId, choice) => {
+    const csrf = getCookie('bili_jct')
+    if (!csrf) throw new Error('登录凭据缺失')
+    const query = await signWbi(current, uid, { web_location: '444.8' })
+    const fields = { msg: choice.msg, roomid: roomId, bubble: '0', color: '16777215', mode: '1',
+      fontsize: '25', rnd: String(Math.floor(Date.now() / 1000)), csrf, csrf_token: csrf,
+      statistics: JSON.stringify({ appId: 100, platform: 5 }), data_extend: JSON.stringify({ trackid: '-99998' }) }
+    if (choice.image) { fields.dm_type = '1'; fields.emoticon_options = '{}' }
+    else { fields.room_type = '0'; fields.jumpfrom = '0' }
+    return apiRequest(current, uid, `/msg/send?${query}`, {
+      method: 'POST', danmaku: true, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(fields).toString(),
+    })
+  }
+
+  const sendInteraction = async (current, uid, medal, clickTimes) => {
     if (await getValue(STORAGE.paused(uid), false)) return 'skipped'
     const roomQuery = await signWbi(current, uid, { room_id: medal.roomId, web_location: '444.8' })
     const roomData = await apiRequest(current, uid, `/xlive/web-room/v1/index/getInfoByRoom?${roomQuery}`)
     if (roomData.room_info?.live_status == null) return deferRoom(current, uid, medal, '无法确认房间开播状态')
-    if (Number(roomData.room_info.live_status) !== 1) {
-      return deferRoom(current, uid, medal, '未开播，等待开播后点赞')
-    }
+    const useDanmaku = Number(roomData.room_info.live_status) !== 1
+    if (useDanmaku && !await getValue(STORAGE.danmakuEnabled, true)) return deferRoom(current, uid, medal, '未开播，弹幕模式已关闭')
     const anchorId = validId(roomData.room_info?.uid) ? String(roomData.room_info.uid) : medal.targetId
     if (!validId(anchorId)) return deferRoom(current, uid, medal, '无法确认主播 UID')
     if (validId(medal.targetId) && anchorId !== medal.targetId) {
@@ -367,18 +420,24 @@
     const taskData = await readMedalTask(current, uid, anchorId)
     const lightedBefore = readLighted(taskData)
     await updateObservedMedal(current, uid, medal.roomId, lightedBefore)
-    const task = Array.isArray(taskData.task_info) ? taskData.task_info.find(item => item.jump_type === 'like') : null
-    if (!task) return deferRoom(current, uid, medal, '该勋章没有可用的点赞任务')
-    if ([true, 1, '1'].includes(task.is_done)) return deferRoom(current, uid, medal, '点赞任务已完成，暂不重复发送')
-    const required = Number(String(task.title ?? '').match(/(\d+)\s*次/)?.[1] ?? 30)
-    const count = Math.max(clickTimes, required)
+    if (useDanmaku && lightedBefore !== false) return deferRoom(current, uid, medal,
+      lightedBefore === true ? '勋章已激活，无需发弹幕' : '无法确认勋章未激活，暂不发弹幕')
+    const sendRoomId = validId(roomData.room_info.room_id) ? String(roomData.room_info.room_id) : medal.roomId
+    const action = useDanmaku ? '弹幕' : '点赞'
+    const task = Array.isArray(taskData.task_info) ? taskData.task_info.find(item => item.jump_type === (useDanmaku ? 'sendDanmu' : 'like')) : null
+    if (!task) return deferRoom(current, uid, medal, `该勋章没有可用的${action}任务`)
+    if ([true, 1, '1'].includes(task.is_done)) return deferRoom(current, uid, medal, `${action}任务已完成，暂不重复发送`)
+    const required = Number(String(task.title ?? '').match(/(\d+)\s*[次条]/)?.[1] ?? (useDanmaku ? 10 : 30))
+    // sub_title 可能表示每日完成轮次，不能把它当成已发送条数。
+    const count = useDanmaku ? Math.min(CONFIG.maxDanmakuPerRound, required) : Math.max(clickTimes, required)
     if (!Number.isInteger(count) || count < 1 || count > CONFIG.maxClickTimes) {
-      return deferRoom(current, uid, medal, '任务要求的点赞次数超出可处理范围')
+      return deferRoom(current, uid, medal, '任务要求的次数超出可处理范围或已完成')
     }
     const csrf = getCookie('bili_jct')
     if (!csrf) throw new Error('未检测到登录凭据，请先登录 Bilibili')
-    const query = await signWbi(current, uid, { click_time: count, room_id: medal.roomId,
+    const query = useDanmaku ? '' : await signWbi(current, uid, { click_time: count, room_id: medal.roomId,
       anchor_id: anchorId, uid, csrf, web_location: '444.8' })
+    const choices = useDanmaku ? await getDanmakuChoices(current, uid, sendRoomId, anchorId) : []
     const key = STORAGE.room(uid, medal.roomId)
     const previous = await getValue(key, null)
     const inactive = lightedBefore === false || (lightedBefore === null && medal.isLighted === false)
@@ -386,7 +445,7 @@
     if (await getValue(STORAGE.paused(uid), false)) return 'skipped'
     const record = { ...previous, lastSuccessAt: previous?.lastSuccessAt ?? 0,
       attemptedAt: Date.now(), attemptId: createId(), term: current.term, outcome: 'pending',
-      verification: '', wasLighted: lightedBefore, lastError: '', clickTimes: count, medalName: medal.medalName, anchorName: medal.anchorName }
+      verification: '', wasLighted: lightedBefore, lastError: '', action, sentCount: 0, clickTimes: useDanmaku ? 0 : count, medalName: medal.medalName, anchorName: medal.anchorName }
     await assertSession(current, uid)
     await setValue(key, record)
     if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
@@ -395,21 +454,68 @@
       await setValue(key, { ...record, outcome: 'cancelled' })
       return 'skipped'
     }
+    let sendInFlight = false
     try {
-      await apiRequest(current, uid, `/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3?${query}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: '',
-      })
+      if (!useDanmaku) {
+        sendInFlight = true
+        await apiRequest(current, uid, `/xlive/app-ucenter/v1/like_info_v3/like/likeReportV3?${query}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: '',
+        })
+        sendInFlight = false
+      } else {
+        for (let index = 0; index < count; index += 1) {
+          if (index > 0) {
+            const sendAt = Date.now() + randomInt(CONFIG.danmakuDelayMinMs, CONFIG.danmakuDelayMaxMs)
+            await updateStatus(current, { uid, phase: 'danmaku-waiting', current: `${medal.medalName || medal.roomId} · ${record.sentCount}/${count}`, sendAt })
+            await sleep(Math.max(0, sendAt - Date.now()), current.controller.signal)
+          }
+          await assertSession(current, uid)
+          if (await getValue(STORAGE.paused(uid), false) || !await getValue(STORAGE.danmakuEnabled, true)) break
+          const statusQuery = await signWbi(current, uid, { room_id: medal.roomId, web_location: '444.8' })
+          const latestRoom = await apiRequest(current, uid, `/xlive/web-room/v1/index/getInfoByRoom?${statusQuery}`)
+          if (latestRoom.room_info?.live_status == null || Number(latestRoom.room_info.live_status) === 1) break
+          if (index > 0) {
+            const latestTask = await readMedalTask(current, uid, anchorId)
+            const lit = readLighted(latestTask)
+            await updateObservedMedal(current, uid, medal.roomId, lit)
+            if (lit === true) break
+            const item = Array.isArray(latestTask.task_info) ? latestTask.task_info.find(task => task.jump_type === 'sendDanmu') : null
+            if (!item || [true, 1, '1'].includes(item.is_done)) break
+          }
+          const choice = choices[index % choices.length]
+          record.lastMessage = `${choice.source}：${choice.label}`
+          await updateStatus(current, { uid, phase: 'danmaku', current: `${medal.medalName || medal.roomId} · ${index + 1}/${count} · ${record.lastMessage}`, sendAt: 0 })
+          if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
+          await setValue(key, { ...record, outcome: 'pending' })
+          await assertSession(current, uid)
+          if (await getValue(STORAGE.paused(uid), false) || !await getValue(STORAGE.danmakuEnabled, true)) break
+          sendInFlight = true
+          await sendDanmakuMessage(current, uid, sendRoomId, choice)
+          sendInFlight = false
+          record.sentCount += 1
+          record.lastSuccessAt = Date.now()
+          await assertSession(current, uid)
+          if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
+          await setValue(key, { ...record, outcome: 'accepted', verification: 'checking', nextAttemptAt: Date.now() + CONFIG.retryBaseMs })
+        }
+        if (!record.sentCount) {
+          await assertSession(current, uid)
+          await setValue(key, { ...record, outcome: 'cancelled' })
+          return 'skipped'
+        }
+      }
     } catch (error) {
       if (error instanceof LeadershipLostError || error instanceof AccountChangedError) throw error
       await assertSession(current, uid)
       if ((await getValue(key, null))?.attemptId !== record.attemptId) throw new LeadershipLostError()
       if (error.rejected) wbiCache = null
       const failures = Math.min(5, Number(previous?.failureCount || 0) + 1)
-      await setValue(key, { ...record, outcome: error.rejected ? 'rejected' : 'unknown',
+      const unknown = sendInFlight && !error.rejected
+      await setValue(key, { ...record, outcome: unknown ? 'unknown' : error.rejected ? 'rejected' : 'failed',
         lastError: error.message, failureCount: failures,
-        nextAttemptAt: Date.now() + (error.rejected
-          ? Math.min(CONFIG.retryMaxMs, CONFIG.retryBaseMs * 2 ** (failures - 1)) : CONFIG.resendIntervalMs) })
-      return error.rejected ? 'rejected' : 'unknown'
+        nextAttemptAt: Date.now() + (unknown ? CONFIG.resendIntervalMs
+          : Math.min(CONFIG.retryMaxMs, CONFIG.retryBaseMs * 2 ** (failures - 1))) })
+      return unknown ? 'unknown' : error.rejected ? 'rejected' : 'deferred'
     }
     const accepted = { ...record, outcome: 'accepted', lastSuccessAt: Date.now(),
       verification: 'checking', nextAttemptAt: Date.now() + CONFIG.retryBaseMs }
@@ -437,7 +543,7 @@
     const failures = lightedAfter === true ? 0 : Math.min(5, Number(previous?.failureCount || 0) + 1)
     await setValue(key, { ...accepted, checkedAt: Date.now(), failureCount: failures,
       verification: lightedAfter === true ? 'lighted' : lightedAfter === false ? 'unlit' : 'unconfirmed',
-      lastError: lightedAfter === true ? '' : lightedAfter === false ? '点赞已发送，但勋章仍未点亮' : `点赞已发送，无法确认点亮状态${verificationError ? `：${verificationError}` : ''}`,
+      lastError: lightedAfter === true ? '' : lightedAfter === false ? `${action}已发送，但勋章仍未点亮` : `${action}已发送，无法确认点亮状态${verificationError ? `：${verificationError}` : ''}`,
       nextAttemptAt: lightedAfter === true ? 0 : Date.now() + Math.min(CONFIG.retryMaxMs, CONFIG.retryBaseMs * 2 ** (failures - 1)) })
     return 'accepted'
   }
@@ -447,6 +553,7 @@
     await updateStatus(current, { uid, phase: 'scanning', current: '', nextScanAt: 0, lastError: '', lastResult: '' })
     const medals = await getAllMedals(current, uid)
     await setValue(STORAGE.medals(uid), { at: Date.now(), medals })
+    const danmakuEnabled = await getValue(STORAGE.danmakuEnabled, true)
     const candidates = []
     const neverLiked = new Set()
     let cooling = 0
@@ -456,7 +563,7 @@
     let earliestEligibleAt = Infinity
     for (const medal of medals) {
       const record = await getValue(STORAGE.room(uid, medal.roomId), null)
-      if (medal.liveStatus !== null && medal.liveStatus !== 1) { offline += 1; continue }
+      if (medal.liveStatus !== null && medal.liveStatus !== 1 && (!danmakuEnabled || medal.isLighted !== false)) { offline += 1; continue }
       if (!isDueForLike(record, Date.now(), medal.isLighted === false)) {
         const successDueAt = medal.isLighted === false ? 0 : Number(record?.lastSuccessAt || 0) + CONFIG.resendIntervalMs
         const uncertainDueAt = ['pending', 'unknown'].includes(record?.outcome) ? Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs : 0
@@ -496,12 +603,12 @@
       await assertSession(current, uid)
       await updateStatus(current, { uid, phase: 'processing', current: medal.medalName || medal.roomId })
       try {
-        const outcome = await sendLike(current, uid, medal, clickTimes)
+        const outcome = await sendInteraction(current, uid, medal, clickTimes)
         summary[outcome] += 1
         const name = medal.medalName || medal.roomId
         if (outcome === 'accepted') {
           const saved = await getValue(STORAGE.room(uid, medal.roomId), null)
-          if (saved?.verification === 'lighted') { summary.confirmed += 1; lastResult = `${saved.wasLighted === true ? '已发送，确认勋章已激活' : '已发送并确认点亮'}：${name}` }
+          if (saved?.verification === 'lighted') { summary.confirmed += 1; lastResult = `${saved.action || '互动'}${saved.sentCount ? ` ${saved.sentCount} 条` : ''}已发送，${saved.wasLighted === true ? '确认勋章已激活' : '已确认点亮'}：${name}` }
           else {
             summary[saved?.verification === 'unlit' ? 'unlit' : 'unconfirmed'] += 1
             lastResult = `${name}：${saved?.lastError || '点赞已发送，点亮状态待确认'}`
@@ -712,17 +819,17 @@
         [hidden]{display:none!important} #panel{width:min(460px,calc(100vw - 32px));max-height:85vh;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 12px 48px #0004}
         header{display:flex;align-items:center;justify-content:space-between;gap:12px} h2{font-size:18px;margin:0} #status{white-space:pre-wrap;overflow-wrap:anywhere;margin:16px 0;font:inherit}
         .actions,form{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0} input{width:90px;padding:7px;border:1px solid var(--border);border-radius:6px;background:var(--input);color:var(--text)}
-        #panel:has(#medal-list:not([hidden])){width:min(1050px,calc(100vw - 32px))} #table-scroll{overflow:auto;max-height:45vh} table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:9px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top;min-width:110px;overflow-wrap:anywhere} th{position:sticky;top:0;background:var(--surface)} td small{display:block;color:var(--muted)} #list-time{font-size:12px;color:var(--muted)} #message{min-height:24px;color:var(--accent)} #close{padding:4px 10px}
+        #panel:has(#medal-list:not([hidden])){width:min(1050px,calc(100vw - 32px))} #table-scroll{overflow:auto;max-height:45vh} table{width:100%;border-collapse:collapse;font-size:13px} th,td{padding:9px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top;min-width:110px;overflow-wrap:anywhere} th{position:sticky;top:0;background:var(--surface)} td small{display:block;color:var(--muted)} #list-time{font-size:12px;color:var(--muted)} input[type=checkbox]{width:auto;accent-color:var(--accent)} #message{min-height:24px;color:var(--accent)} #close{padding:4px 10px}
       </style>
       <div id="backdrop" hidden>
         <section id="panel" role="dialog" aria-modal="true" aria-labelledby="title" tabindex="-1">
           <header><h2 id="title">粉丝勋章保活</h2><button id="close" aria-label="关闭">×</button></header>
           <pre id="status">正在读取状态…</pre>
           <div class="actions"><button id="pause">暂停任务</button><button id="scan">立即执行一次</button><button id="list-toggle" aria-expanded="false">查看勋章列表</button></div>
-          <form id="settings"><label for="clicks">单次点赞数</label><input id="clicks" type="number" min="1" max="3000" step="1" required><button type="submit">保存</button></form>
+          <form id="settings"><label for="clicks">单次点赞数</label><input id="clicks" type="number" min="1" max="3000" step="1" required><button type="submit">保存</button><label><input id="danmaku-enabled" type="checkbox">未开播时用表情弹幕点亮</label></form>
           <section id="medal-list" hidden>
             <div class="actions"><button id="list-refresh">刷新激活状态</button><span id="list-time"></span></div>
-            <div id="table-scroll"><table><thead><tr><th>勋章 / 主播</th><th>激活状态</th><th>处理状态</th><th>上次点赞</th><th>最近结果</th></tr></thead><tbody id="medal-rows"></tbody></table></div>
+            <div id="table-scroll"><table><thead><tr><th>勋章 / 主播</th><th>激活状态</th><th>处理状态</th><th>上次互动</th><th>最近结果</th></tr></thead><tbody id="medal-rows"></tbody></table></div>
             <p id="list-empty"></p>
           </section>
           <div id="message" role="status" aria-live="polite"></div>
@@ -790,7 +897,8 @@
         const value = Number(find('clicks').value)
         if (!Number.isInteger(value) || value < CONFIG.minClickTimes || value > CONFIG.maxClickTimes) throw new Error('请输入 1–3000 的整数')
         await setValue(STORAGE.clickTimes, value)
-        find('message').textContent = `已保存单次点赞数：${value}`
+        await setValue(STORAGE.danmakuEnabled, find('danmaku-enabled').checked)
+        find('message').textContent = '设置已保存'
         await refreshStatus()
       })
     })
@@ -815,11 +923,11 @@
   const renderMedalList = () => {
     if (!panelSnapshot || controls.find('medal-list').hidden) return
     const { find } = controls
-    const { uid, roster, records, queue, paused } = panelSnapshot
+    const { uid, roster, records, queue, paused, danmakuEnabled } = panelSnapshot
     const medals = roster?.medals ?? []
     const queuePositions = new Map((Array.isArray(queue) ? queue : []).map((id, index) => [id, index + 1]))
     const outcomeNames = { deferred: '暂缓处理', accepted: '已发送', rejected: '被拒绝', unknown: '结果未知', pending: '发送中 / 未确认', cancelled: '已取消', failed: '处理失败' }
-    const formatTime = value => value ? new Date(value).toLocaleString() : '未点赞过'
+    const formatTime = value => value ? new Date(value).toLocaleString() : '无发送记录'
     const rows = medals.map(medal => {
       const record = records[medal.roomId]
       const inactive = medal.isLighted === false
@@ -828,8 +936,8 @@
       const eligibleAt = Math.max(!inactive ? Number(record?.lastSuccessAt || 0) + CONFIG.resendIntervalMs : 0,
         uncertain ? Number(record.attemptedAt || 0) + CONFIG.resendIntervalMs : 0, Number(record?.nextAttemptAt || 0))
       const position = queuePositions.get(medal.roomId)
-      const state = medal.liveStatus !== null && medal.liveStatus !== 1 ? '未开播，等待开播'
-        : !due ? uncertain ? '发送结果待确认' : Number(record?.nextAttemptAt) > Date.now() ? '暂缓重试' : '冷却中'
+      const state = !due ? uncertain ? '发送结果待确认' : Number(record?.nextAttemptAt) > Date.now() ? '暂缓重试' : '冷却中'
+        : medal.liveStatus !== null && medal.liveStatus !== 1 ? danmakuEnabled && inactive ? '未开播，表情弹幕点亮' : '未开播，等待开播'
         : inactive ? '优先处理' : position ? `队列第 ${position} 位` : '可进入随机队列'
       return { medal, record, state: paused ? `已暂停 · ${state}` : state, eligibleAt: due ? 0 : eligibleAt }
     })
@@ -846,7 +954,7 @@
         [medal.isLighted === false ? '未激活' : medal.isLighted === true ? '已激活' : '未知', medal.lightCheckedAt ? `复查于 ${new Date(medal.lightCheckedAt).toLocaleString()}` : ''],
         [state, eligibleAt ? `可处理时间：${new Date(eligibleAt).toLocaleString()}` : ''],
         [formatTime(record?.lastSuccessAt)],
-        [record?.outcome !== 'accepted' ? outcomeNames[record?.outcome] ?? '尚未处理' : record?.verification === 'lighted' ? '已确认点亮' : record?.verification === 'unlit' ? '已发送，仍未点亮' : record?.verification === 'unconfirmed' ? '已发送，未能确认' : record?.verification === 'checking' ? '已发送，正在确认' : outcomeNames[record?.outcome] ?? '尚未处理', record?.lastError || ''],
+        [record?.outcome !== 'accepted' ? outcomeNames[record?.outcome] ?? '尚未处理' : record?.verification === 'lighted' ? '已确认点亮' : record?.verification === 'unlit' ? '已发送，仍未点亮' : record?.verification === 'unconfirmed' ? '已发送，未能确认' : record?.verification === 'checking' ? '已发送，正在确认' : outcomeNames[record?.outcome] ?? '尚未处理', [record?.action ? `${record.action}${record.sentCount ? ` ${record.sentCount} 条` : ''}` : '', record?.lastMessage || '', record?.lastError || ''].filter(Boolean).join(' · ')],
       ]
       for (const [text, detail] of values) {
         const cell = document.createElement('td')
@@ -866,9 +974,9 @@
     if (uid !== getUid()) { refreshOpenPanel(); return }
     const sameAccount = uid && status.uid === uid
     const summary = sameAccount ? status.lastSummary ?? {} : {}
-    const busy = sameAccount && ['scanning', 'delaying', 'processing', 'verifying'].includes(status.phase)
+    const busy = sameAccount && ['scanning', 'delaying', 'processing', 'verifying', 'danmaku', 'danmaku-waiting'].includes(status.phase)
     const pendingRequest = request?.id && request.id !== schedule?.acknowledgedRequest
-    const phases = { scanning: '正在读取勋章并选择候选', delaying: '已选中勋章，等待发送', processing: '正在发送点赞', verifying: '正在确认点亮状态', idle: '本轮完成', waiting: '等待下一轮', paused: '已暂停', 'login-required': '等待登录', error: '运行出错' }
+    const phases = { scanning: '正在读取勋章并选择候选', delaying: '已选中勋章，等待发送', processing: '正在检查互动任务', verifying: '正在确认点亮状态', danmaku: '正在发送表情弹幕', 'danmaku-waiting': '等待下一条弹幕', idle: '本轮完成', waiting: '等待下一轮', paused: '已暂停', 'login-required': '等待登录', error: '运行出错' }
     const formatTime = value => value ? new Date(value).toLocaleString() : '无'
     const countdown = value => {
       const seconds = Math.max(0, Math.ceil((value - Date.now()) / 1000))
@@ -883,7 +991,7 @@
       outdatedLeader ? '旧版控制者仍在运行，请刷新所有已打开的 B 站标签页。' : '',
       `状态：${!validId(uid) ? '等待登录' : paused ? '已暂停' : !busy && pendingRequest ? '立即执行请求已排队' : sameAccount ? phases[status.phase] ?? status.phase : '等待当前账号的状态'}`,
       `正在处理：${sameAccount && status.current ? status.current : '无'}`,
-      sameAccount && !paused && status.phase === 'delaying' ? `发送倒计时：${countdown(status.sendAt)}` : '',
+      sameAccount && !paused && ['delaying', 'danmaku-waiting'].includes(status.phase) ? `发送倒计时：${countdown(status.sendAt)}` : '',
       `下次执行：${paused ? '已暂停' : busy ? '本轮结束后安排' : pendingRequest ? '尽快执行' : nextAt ? `${formatTime(nextAt)}（${nextAt > Date.now() ? `剩余 ${countdown(nextAt)}` : '等待控制者开始'}）` : '等待安排'}`,
       `上次扫描：${formatTime(sameAccount ? status.lastScanAt : 0)}`,
       `上轮：成功发送 ${summary.accepted ?? 0} / 拒绝 ${summary.rejected ?? 0} / 结果未知 ${summary.unknown ?? 0} / 处理失败 ${summary.failed ?? 0}`,
@@ -907,13 +1015,14 @@
         panelRefreshAgain = false
         const uid = getUid()
         watchPanelAccount(uid)
-        const [status, peers, paused, schedule, request, queue, clickTimes, roster] = await Promise.all([
+        const [status, peers, paused, schedule, request, queue, clickTimes, roster, danmakuEnabled] = await Promise.all([
           getValue(STORAGE.status, {}), readPeers(),
           validId(uid) ? getValue(STORAGE.paused(uid), false) : false,
           validId(uid) ? getValue(STORAGE.schedule(uid), null) : null,
           validId(uid) ? getValue(STORAGE.request(uid), null) : null,
           validId(uid) ? getValue(STORAGE.queue(uid), []) : [], getClickTimes(),
           validId(uid) ? getValue(STORAGE.medals(uid), null) : null,
+          getValue(STORAGE.danmakuEnabled, true),
         ])
         if (uid !== getUid()) { panelRefreshAgain = true; continue }
         const records = {}
@@ -925,7 +1034,7 @@
           }))
         }
         if (uid !== getUid()) { panelRefreshAgain = true; continue }
-        panelSnapshot = { uid, status, leader: selectLeader(peers), paused, schedule, request, queue, clickTimes, roster, records }
+        panelSnapshot = { uid, status, leader: selectLeader(peers), paused, schedule, request, queue, clickTimes, roster, records, danmakuEnabled }
         renderStatus()
       } while (panelRefreshAgain && panelIsOpen())
     })().finally(() => { panelRefreshTask = null })
@@ -940,6 +1049,7 @@
       controls.themeObserver.observe(document.documentElement, options)
       if (document.body) controls.themeObserver.observe(document.body, options)
       find('clicks').value = String(await getClickTimes())
+      find('danmaku-enabled').checked = await getValue(STORAGE.danmakuEnabled, true)
       find('message').textContent = ''
       find('panel').focus()
     }
@@ -955,7 +1065,7 @@
     void showStatus().catch(error => { warn(error); if (controls) controls.find('message').textContent = error.message })
   })
   GM_addValueChangeListener(STORAGE.signal, () => wakeWorker())
-  for (const key of [STORAGE.status, STORAGE.clickTimes, STORAGE.signal]) {
+  for (const key of [STORAGE.status, STORAGE.clickTimes, STORAGE.signal, STORAGE.danmakuEnabled]) {
     GM_addValueChangeListener(key, refreshOpenPanel)
   }
   addEventListener('pagehide', () => {
